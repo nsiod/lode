@@ -7,6 +7,9 @@ license = "MIT"
 description = "Universal, single-binary update lode: verifies integrity + publisher identity, then launches and manages a packaged app as a child process."
 repository = "https://github.com/dotns/lode"
 default-run = "lode"
+# `examples/` holds standalone demo apps (Go/Bun/Rust, each its own project), NOT
+# Cargo example targets — disable auto-discovery so `cargo --all-targets` ignores it.
+autoexamples = false
 
 [[bin]]
 name = "lode"

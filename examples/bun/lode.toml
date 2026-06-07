@@ -1,0 +1,37 @@
+# lode.toml — run the Bun demo under lode. Ship the single bundled file from
+# `bun run package.ts` (dist/app.js) as the release asset; lode downloads bun.
+
+[global]
+app      = "demo-bun"
+data_dir = "/srv/lode"    # MUST be a persistent volume (runtime cache + versions + state.json)
+
+[update]
+github = "owner/demo-bun"           # GitHub Releases … (or: manifest = "https://…/manifest.json")
+asset  = "app.js"                   # the bundled single file (format = raw, entry = app.js)
+policy = "auto"
+
+[trust]
+require_signature = "enforce"
+trusted_keys = ["<key_id>:<base64-pubkey>"]
+
+[command]
+run  = "bun run"   # bare `lode` → bun run <entry>
+exec = "bun"       # `lode <args>` → bun <args>
+
+# lode downloads bun if absent from PATH, caches it at $DATA_DIR/runtime/bun, and
+# pins the version. Drop this block if bun is already baked into the base image.
+[runtime]
+runtime  = "bun"
+download = "https://github.com/oven-sh/bun/releases/download/bun-v1.1.38/bun-linux-x64.zip"
+version  = "1.1.38"
+
+[supervise]
+readiness     = "state"
+ready_timeout = 20
+health_grace  = 5
+stop_timeout  = 10
+restart       = "on-failure"
+
+# Optional defaults (a host `-e APP_GREETING=…` overrides these):
+[env]
+APP_GREETING = "hello from lode (bun)"

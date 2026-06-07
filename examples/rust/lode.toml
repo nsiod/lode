@@ -1,0 +1,31 @@
+# lode.toml — run the Rust demo under lode. Self-contained static binary, so no
+# [runtime] block. Build: cargo build --release --target x86_64-unknown-linux-musl
+# then ship target/<triple>/release/lode-demo-rust as the asset.
+
+[global]
+app      = "demo-rust"
+data_dir = "/srv/lode"    # MUST be a persistent volume for the version cache + state.json
+
+[update]
+github = "owner/demo-rust"          # GitHub Releases … (or: manifest = "https://…/manifest.json")
+asset  = "demo-rust-linux-x64"      # the binary filename for THIS host (format = raw)
+policy = "auto"
+
+[trust]
+require_signature = "enforce"
+trusted_keys = ["<key_id>:<base64-pubkey>"]
+
+[command]
+run  = "{entry}"   # bare `lode` → run the binary as the long-running server
+exec = "{entry}"   # `lode <args>` → binary <args>  (e.g. `lode version`)
+
+[supervise]
+readiness     = "state"
+ready_timeout = 20
+health_grace  = 5
+stop_timeout  = 10
+restart       = "on-failure"
+
+# Optional defaults (a host `-e APP_GREETING=…` overrides these):
+[env]
+APP_GREETING = "hello from lode (rust)"
