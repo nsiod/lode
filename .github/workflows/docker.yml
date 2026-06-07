@@ -75,10 +75,5 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # Supply-chain attestations: SLSA provenance + SBOM. Docker Hub supports
-          # OCI attestation manifests, so the multi-arch index push succeeds (the
-          # attestations appear as extra unknown/unknown manifest entries — cosmetic,
-          # not a push failure). If a future Docker Hub change rejects the OCI index,
-          # set both back to false and document the specific push error here.
           provenance: true
           sbom: true
