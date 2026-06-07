@@ -47,7 +47,7 @@ trusted_keys = ["<key_id>:<base64-pubkey>"]         # from `lode-cli keygen`
 [command]
 run     = "{entry}"         # bare `lode` → launch the app ({entry} = installed path)
 exec    = "{entry}"         # `lode <args>` → passthrough base
-workdir = "{dir}"           # version dir (default) or an absolute path
+# workdir = "{dir}"         # optional; omit for the version dir (default). Set an absolute path to run elsewhere (e.g. for .env discovery)
 
 [supervise]
 readiness    = "state"      # none | state (commit a version only after the app reports ready)
@@ -59,7 +59,7 @@ restart      = "off"        # off (mirror child) | on-failure | always
 Common shapes:
 
 - **Self-contained binary:** `run = "{entry} serve"`, `exec = "{entry}"`.
-- **Script under a runtime:** `run = "bun run"`, `exec = "bun"`, plus a `[runtime]` block to fetch `bun` if it's not on PATH (verified like any artifact).
+- **Script under a runtime:** `run = "bun run"`, `exec = "bun"`, plus a `[runtime]` block to fetch `bun` if it's not on PATH — cached for reuse, optionally version-pinned (`version`); note a runtime download is **not** signature-verified.
 - **Private source:** add `[http].headers = ["Authorization: Bearer ${TOKEN}"]` — sent on manifest + artifact fetches, with `${ENV}` expansion.
 
 See [`lode.example.toml`](lode.example.toml) for every option and `[runtime]`/`[signals]`/`restart_*`.
@@ -73,7 +73,9 @@ What *your app* implements. Any language — read/write one JSON file and handle
 **Environment lode injects:** `LODE_ACTIVE_VERSION` (current version), `LODE_DATA_DIR`
 (`state.json` lives at `$LODE_DATA_DIR/state.json`), `LODE_INSTANCE` (unique id for this
 launch — write it to `state.ready`). The host env (e.g. `PORT`) passes through; internal
-`LODE_*` are stripped.
+`LODE_*` are stripped. The operator can add more via the `[env]` table — those are
+**defaults**: an inherited host env var of the same name (e.g. a per-deploy `-e PORT`)
+wins over them, and lode's three vars above always win over everything.
 
 **state.json** — lode writes status, the app writes requests; the field sets don't overlap:
 

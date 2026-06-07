@@ -91,12 +91,9 @@ pub(crate) struct Channel {
     pub(crate) latest: String,
 }
 
-/// One published version: optional gate/notes plus its assets, keyed by filename.
+/// One published version: optional notes plus its assets, keyed by filename.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct VersionEntry {
-    /// Minimum loader version required to install this version.
-    #[serde(default)]
-    pub(crate) min_lode: Option<String>,
     /// Human-readable release notes (shown by `update`).
     #[serde(default)]
     pub(crate) notes: Option<String>,
@@ -434,7 +431,6 @@ fn map_release(
         return Err(Error::Manifest(format!("release {ver:?} has no assets")));
     }
     let entry = VersionEntry {
-        min_lode: None,
         notes: None,
         assets,
     };

@@ -9,6 +9,7 @@
 //! Header values and trusted keys are stored verbatim and never expanded or
 //! logged here; `${ENV}` expansion happens at fetch time in the http module.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -108,6 +109,9 @@ pub(crate) struct Config {
     pub(crate) runtime: Runtime,
     pub(crate) supervise: Supervise,
     pub(crate) signals: Signals,
+    /// `[env]` — extra environment variables injected into the child (on top of
+    /// the inherited host env; lode's own `LODE_*` introspection vars still win).
+    pub(crate) env: BTreeMap<String, String>,
 }
 
 /// `[global]` — identity and storage.
@@ -168,10 +172,22 @@ pub(crate) struct Command {
 }
 
 /// `[runtime]` — optional runtime dependency.
+// `runtime` mirrors the `[runtime] runtime = "…"` TOML key, so the field name is
+// fixed by the schema even though it repeats the struct name.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone)]
 pub(crate) struct Runtime {
     pub(crate) runtime: Option<String>,
     pub(crate) download: Option<String>,
+    /// Expected runtime version. When set, lode probes the runtime (PATH, cache,
+    /// or freshly downloaded) and requires its self-reported version to *contain*
+    /// this string; a wrong-version PATH/cache entry is bypassed for a fresh
+    /// download, and a downloaded mismatch is a hard error.
+    pub(crate) version: Option<String>,
+    /// Argument(s) that make the runtime print its version (whitespace-split,
+    /// appended to the runtime binary). Defaults to `--version`. Only used when
+    /// [`version`](Self::version) is set.
+    pub(crate) version_check: Option<String>,
 }
 
 /// `[supervise]` — restart policy / health / rollback / stop / restart mode.
@@ -220,6 +236,8 @@ struct TomlConfig {
     supervise: TomlSupervise,
     #[serde(default)]
     signals: TomlSignals,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -268,6 +286,8 @@ struct TomlCommand {
 struct TomlRuntime {
     runtime: Option<String>,
     download: Option<String>,
+    version: Option<String>,
+    version_check: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -365,6 +385,10 @@ fn merge(cli: &Globals, t: &TomlConfig) -> Config {
         runtime: merge_runtime(cli, &t.runtime),
         supervise: merge_supervise(cli, &t.supervise),
         signals: merge_signals(cli, &t.signals),
+        // `[env]` is config-file only — no CLI/env override layer. To override an
+        // entry at deploy time, set it directly in the process env (it wins as a
+        // host env var; see `child_env`).
+        env: t.env.clone(),
     }
 }
 
@@ -479,6 +503,11 @@ fn merge_runtime(cli: &Globals, t: &TomlRuntime) -> Runtime {
     Runtime {
         runtime: cli.runtime.clone().or_else(|| t.runtime.clone()),
         download: cli.runtime_download.clone().or_else(|| t.download.clone()),
+        version: cli.runtime_version.clone().or_else(|| t.version.clone()),
+        version_check: cli
+            .runtime_version_check
+            .clone()
+            .or_else(|| t.version_check.clone()),
     }
 }
 
@@ -580,6 +609,8 @@ mod tests {
             workdir: None,
             runtime: None,
             runtime_download: None,
+            runtime_version: None,
+            runtime_version_check: None,
             restart: None,
             restart_backoff: None,
             restart_backoff_max: None,

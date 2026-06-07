@@ -185,7 +185,6 @@ asset    = "myapp-linux-x64.tar.gz"
   "channels": { "stable": { "latest": "1.5.0" } },
   "versions": {
     "1.5.0": {
-      "min_lode": "0.0.1",
       "notes": "…",
       "assets": [
         { "name": "myapp-linux-x64.tar.gz",
@@ -214,7 +213,7 @@ asset    = "myapp-linux-x64.tar.gz"
 
 - **版本指针。** `channels.<c>.latest` 必须**被签**(§2 目录签名)**或**操作者 `pin` 死
   版本 —— 否则可能被降级。
-- native 可比 GitHub 多(`channels`、`min_lode`、`notes`、detached `.sig`、`size`、
+- native 可比 GitHub 多(`channels`、`notes`、detached `.sig`、`size`、
   `auth`);但全部仍在底层归约成 `(name, version, sha256) + sig`。
 
 **发布:**

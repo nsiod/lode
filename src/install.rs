@@ -9,7 +9,8 @@
 //! rename. Pruning keeps `current` + `last_good` + the newest `keep_versions`.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read as _};
 use std::path::{Component, Path, PathBuf};
@@ -195,10 +196,11 @@ pub(crate) fn marker(cfg: &Config, version: &str) -> Result<Marker> {
 
 /// Place a downloaded runtime payload into `runtime_dir`, reusing the same
 /// per-`format` extraction as a version install (design §4 "[runtime]"). `raw`/`gz`
-/// land as `runtime_dir/<name>`; archives are unpacked into `runtime_dir`. The
-/// named binary, when present at the root, is made executable. The supervisor
-/// prepends `runtime_dir` to the child PATH. No digest/signature check — the
-/// `[runtime]` config carries none.
+/// land as `runtime_dir/<name>`; archives are unpacked into `runtime_dir` and the
+/// named binary is hoisted to `runtime_dir/<name>` (see [`hoist_runtime_bin`]) so it
+/// always ends up at the root the supervisor puts on the child PATH — even when the
+/// archive nests it. The placed binary is made executable. No digest/signature check
+/// — the `[runtime]` config carries none.
 pub(crate) fn place_runtime(
     runtime_dir: &Path,
     temp_path: &Path,
@@ -214,8 +216,14 @@ pub(crate) fn place_runtime(
                 .map_err(|e| Error::Install(format!("place runtime: {e}")))?;
         }
         "gz" => gunzip_file(temp_path, &runtime_dir.join(name))?,
-        "tar.gz" | "tgz" => unpack_tar_gz(temp_path, runtime_dir)?,
-        "zip" => unpack_zip(temp_path, runtime_dir)?,
+        "tar.gz" | "tgz" => {
+            unpack_tar_gz(temp_path, runtime_dir)?;
+            hoist_runtime_bin(runtime_dir, name)?;
+        }
+        "zip" => {
+            unpack_zip(temp_path, runtime_dir)?;
+            hoist_runtime_bin(runtime_dir, name)?;
+        }
         other => {
             return Err(Error::Install(format!(
                 "unsupported runtime format {other:?}"
@@ -227,6 +235,63 @@ pub(crate) fn place_runtime(
         chmod_x(&bin)?;
     }
     Ok(())
+}
+
+/// Guarantee the runtime binary sits at `runtime_dir/<name>` after an archive
+/// extraction. Official runtime archives commonly nest the binary (bun's `.zip` is
+/// `bun-linux-x64/bun`; node's `.tar.gz` is `node-vX/bin/node`; deno's `.zip` is a
+/// flat `deno` at the root). When it isn't already at the root we locate it in the
+/// extracted tree (shallowest match) and move it up, so the supervisor's single PATH
+/// entry can find it. Errors when the archive contains no such file — a clearer
+/// failure than a later "command not found" at launch.
+fn hoist_runtime_bin(runtime_dir: &Path, name: &str) -> Result<()> {
+    let target = runtime_dir.join(name);
+    if target.is_file() {
+        return Ok(()); // already at the root (a flat archive like deno's)
+    }
+    find_named_file(runtime_dir, name)?.map_or_else(
+        || {
+            Err(Error::Install(format!(
+                "runtime binary {name:?} not found in the downloaded archive"
+            )))
+        },
+        |found| {
+            fs::rename(&found, &target)
+                .map_err(|e| Error::Install(format!("hoist runtime {name:?}: {e}")))
+        },
+    )
+}
+
+/// Breadth-first search under `root` for a regular file whose final path component
+/// equals `name`, returning the shallowest match (so a top-level binary wins over a
+/// same-named file buried deeper). Symlinks are skipped, never followed, so a hostile
+/// archive symlink can't redirect the search outside the tree. `root` is already
+/// bounded by the extraction entry cap, so the walk is bounded.
+fn find_named_file(root: &Path, name: &str) -> Result<Option<PathBuf>> {
+    let wanted = OsStr::new(name);
+    let mut queue: VecDeque<PathBuf> = VecDeque::new();
+    queue.push_back(root.to_path_buf());
+    while let Some(dir) = queue.pop_front() {
+        let mut subdirs: Vec<PathBuf> = Vec::new();
+        for entry in fs::read_dir(&dir).map_err(|e| Error::Install(format!("scan runtime: {e}")))? {
+            let entry = entry.map_err(|e| Error::Install(format!("scan runtime: {e}")))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|e| Error::Install(format!("scan runtime: {e}")))?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_file() {
+                if entry.file_name() == wanted {
+                    return Ok(Some(entry.path()));
+                }
+            } else if file_type.is_dir() {
+                subdirs.push(entry.path());
+            }
+        }
+        queue.extend(subdirs); // enqueue this level's dirs after its files → BFS by depth
+    }
+    Ok(None)
 }
 
 // --- verification ----------------------------------------------------------
@@ -867,6 +932,8 @@ mod tests {
             runtime: Runtime {
                 runtime: None,
                 download: None,
+                version: None,
+                version_check: None,
             },
             supervise: Supervise {
                 restart: RestartPolicy::Off,
@@ -884,6 +951,7 @@ mod tests {
                 forward: Vec::new(),
                 restart: None,
             },
+            env: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1258,7 +1326,6 @@ mod tests {
         versions.insert(
             "1.0.0".to_owned(),
             VersionEntry {
-                min_lode: None,
                 notes: None,
                 assets: vec![asset("app.bin", "abc", Some("app"))],
             },
@@ -1429,6 +1496,56 @@ mod tests {
         fs::write(&gz, &gz_bytes).unwrap();
         place_runtime(&runtime_dir, &gz, "gz", "tool").unwrap();
         assert_eq!(fs::read(runtime_dir.join("tool")).unwrap(), plain);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn place_runtime_hoists_nested_archive_binary() {
+        let dir = scratch("runtime-hoist");
+
+        // bun-style .zip: the binary is nested under bun-linux-x64/bun.
+        let zd = dir.join("rt-zip");
+        let zsrc = dir.join("bun.zip");
+        fs::write(
+            &zsrc,
+            zip_of(&[("bun-linux-x64/bun", b"#!/bin/sh\necho bun\n")]),
+        )
+        .unwrap();
+        place_runtime(&zd, &zsrc, "zip", "bun").unwrap();
+        let bun = zd.join("bun"); // hoisted to the root
+        assert_eq!(fs::read(&bun).unwrap(), b"#!/bin/sh\necho bun\n");
+        #[cfg(unix)]
+        assert!(is_executable(&bun));
+
+        // node-style .tar.gz: the binary is nested under node-vX/bin/node, with
+        // siblings (npm) that must be ignored.
+        let td = dir.join("rt-tar");
+        let tsrc = dir.join("node.tar.gz");
+        fs::write(
+            &tsrc,
+            tar_gz_of(&[
+                ("node-v22.0.0-linux-x64/bin/node", b"node-bin\n"),
+                ("node-v22.0.0-linux-x64/bin/npm", b"npm-script\n"),
+            ]),
+        )
+        .unwrap();
+        place_runtime(&td, &tsrc, "tar.gz", "node").unwrap();
+        assert_eq!(fs::read(td.join("node")).unwrap(), b"node-bin\n");
+
+        // deno-style flat .zip: already at the root → left in place.
+        let dd = dir.join("rt-flat");
+        let dsrc = dir.join("deno.zip");
+        fs::write(&dsrc, zip_of(&[("deno", b"deno-bin\n")])).unwrap();
+        place_runtime(&dd, &dsrc, "zip", "deno").unwrap();
+        assert_eq!(fs::read(dd.join("deno")).unwrap(), b"deno-bin\n");
+
+        // archive missing the named binary → clear error (not a silent no-op).
+        let ed = dir.join("rt-missing");
+        let esrc = dir.join("other.zip");
+        fs::write(&esrc, zip_of(&[("some/other-tool", b"x\n")])).unwrap();
+        let err = place_runtime(&ed, &esrc, "zip", "bun").unwrap_err();
+        assert!(matches!(err, Error::Install(_)));
 
         let _ = fs::remove_dir_all(&dir);
     }

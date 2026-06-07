@@ -141,6 +141,16 @@ pub(crate) struct Globals {
         global = true
     )]
     pub(crate) runtime_download: Option<String>,
+    /// Expected runtime version; probed and required to match (substring).
+    #[arg(long = "runtime-version", env = "LODE_RUNTIME_VERSION", global = true)]
+    pub(crate) runtime_version: Option<String>,
+    /// Arg(s) that print the runtime version (default `--version`).
+    #[arg(
+        long = "runtime-version-check",
+        env = "LODE_RUNTIME_VERSION_CHECK",
+        global = true
+    )]
+    pub(crate) runtime_version_check: Option<String>,
 
     // --- [supervise] ---
     /// Restart policy: off | on-failure | always (default off).

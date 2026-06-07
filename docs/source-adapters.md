@@ -207,7 +207,6 @@ Schema `lode/v1`; per-version `assets[]` keyed by `name`:
   "channels": { "stable": { "latest": "1.5.0" } },
   "versions": {
     "1.5.0": {
-      "min_lode": "0.0.1",
       "notes": "…",
       "assets": [
         { "name": "myapp-linux-x64.tar.gz",
@@ -237,7 +236,7 @@ Schema `lode/v1`; per-version `assets[]` keyed by `name`:
 - **Version pointer.** `channels.<c>.latest` must be **signed** (the §2 catalog
   signature) **or** the operator must `pin` a version — otherwise downgrade is
   possible.
-- Native may carry more than GitHub (`channels`, `min_lode`, `notes`, detached
+- Native may carry more than GitHub (`channels`, `notes`, detached
   `.sig`, `size`, `auth`); all of it still reduces to `(name, version, sha256) +
   sig` at the bottom.
 

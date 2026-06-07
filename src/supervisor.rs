@@ -22,7 +22,9 @@
 //! [`std::os::unix::process::CommandExt::exec`], so the crate keeps
 //! `#![forbid(unsafe_code)]`.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::ffi::OsStr;
 use std::os::raw::c_int;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -84,6 +86,7 @@ pub(crate) fn exec_passthrough(cfg: &Config, args: &[String]) -> Result<Infallib
     let command_line = build_exec_argv(&cfg.command.exec, &entry, &dir, args)?;
     let env = child_env(
         std::env::vars(),
+        &cfg.env,
         &target.version,
         &cfg.global.data_dir,
         &instance,
@@ -265,38 +268,91 @@ enum RuntimePlan {
     NotNeeded,
     /// The runtime is already on PATH — nothing to download.
     AlreadyPresent,
+    /// A prior download left the runtime in `$DATA_DIR/runtime/` — reuse it (no
+    /// network). When `$DATA_DIR` is a persistent volume this makes the download a
+    /// one-time cost across restarts.
+    Cached,
     /// The runtime is missing — download it and prepend its dir to the child PATH.
     Fetch,
 }
 
-/// Decide whether the runtime must be downloaded. Errors only when the runtime is
-/// named but absent and no `download` URL is configured.
+/// Decide what to do about the runtime. Precedence: a runtime already on PATH wins
+/// (system runtime), then a cached download is reused, then a fresh download. Errors
+/// only when the runtime is named but absent from PATH and cache with no `download`
+/// URL configured.
 fn plan_runtime(
     runtime: Option<&str>,
     download: Option<&str>,
     present: bool,
+    cached: bool,
 ) -> Result<RuntimePlan> {
     match runtime {
         None => Ok(RuntimePlan::NotNeeded),
         Some(_) if present => Ok(RuntimePlan::AlreadyPresent),
+        Some(_) if cached => Ok(RuntimePlan::Cached),
         Some(_) if download.is_some() => Ok(RuntimePlan::Fetch),
         Some(name) => Err(Error::Process(format!(
-            "runtime {name:?} not found on PATH and no [runtime].download configured"
+            "runtime {name:?} not found on PATH or in cache, and no [runtime].download configured"
         ))),
     }
 }
 
 /// Ensure a configured runtime is available for the child, downloading it into
-/// `$DATA_DIR/runtime/` when absent from PATH. Returns the directory to prepend to
-/// the child's PATH, or `None` when no runtime download is needed.
+/// `$DATA_DIR/runtime/` when absent from PATH and not already cached there. Returns
+/// the directory to prepend to the child's PATH, or `None` when no runtime download
+/// is needed. A previously downloaded runtime (a `runtime/<name>` executable from an
+/// earlier launch) is reused without touching the network, so a persistent
+/// `$DATA_DIR` makes the download a one-time cost; delete `runtime/<name>` to force a
+/// re-download (e.g. to change the runtime version).
 fn ensure_runtime(cfg: &Config) -> Result<Option<PathBuf>> {
     let runtime = cfg.runtime.runtime.as_deref();
     let download_url = cfg.runtime.download.as_deref();
+    let expected = cfg.runtime.version.as_deref();
+    let probe_args = runtime_probe_args(cfg.runtime.version_check.as_deref());
     let path_var = std::env::var("PATH").unwrap_or_default();
-    let present = runtime.is_some_and(|name| on_path(name, &path_var));
+    let runtime_dir = cfg.global.data_dir.join("runtime");
+    // place_runtime lands the binary at `runtime/<name>`; the same path is the cache
+    // key on the next launch.
+    let cached_bin = runtime.map(|name| runtime_dir.join(name));
 
-    match plan_runtime(runtime, download_url, present)? {
+    // Version-gate PATH and cache: a usable runtime must also report the expected
+    // version (when one is configured). A wrong-version PATH/cache entry is treated
+    // as unusable so we fall through to a fresh download that pins the right version.
+    let present_ok = runtime.is_some_and(|name| {
+        on_path(name, &path_var)
+            && expected.is_none_or(|want| {
+                let ok = runtime_version_ok(OsStr::new(name), &probe_args, want);
+                if !ok {
+                    tracing::warn!(
+                        runtime = name,
+                        want,
+                        "PATH runtime version mismatch; trying cache/download"
+                    );
+                }
+                ok
+            })
+    });
+    let cached_ok = cached_bin.as_deref().is_some_and(|bin| {
+        is_executable_file(bin)
+            && expected.is_none_or(|want| {
+                let ok = runtime_version_ok(bin.as_os_str(), &probe_args, want);
+                if !ok {
+                    tracing::info!(want, "cached runtime version mismatch; re-downloading");
+                }
+                ok
+            })
+    });
+
+    match plan_runtime(runtime, download_url, present_ok, cached_ok)? {
         RuntimePlan::NotNeeded | RuntimePlan::AlreadyPresent => Ok(None),
+        RuntimePlan::Cached => {
+            tracing::info!(
+                runtime = runtime.unwrap_or_default(),
+                dir = %runtime_dir.display(),
+                "runtime served from cache; skipping download"
+            );
+            Ok(Some(runtime_dir))
+        }
         RuntimePlan::Fetch => {
             // Both are `Some` here (guaranteed by `plan_runtime`).
             let name = runtime.unwrap_or_default();
@@ -305,7 +361,7 @@ fn ensure_runtime(cfg: &Config) -> Result<Option<PathBuf>> {
             tracing::info!(
                 runtime = name,
                 format,
-                "runtime missing from PATH; downloading"
+                "runtime missing from PATH and cache; downloading"
             );
             let asset = runtime_asset(url, name);
             // The runtime download has no manifest origin to be same-origin with,
@@ -313,11 +369,61 @@ fn ensure_runtime(cfg: &Config) -> Result<Option<PathBuf>> {
             // via `[http].credential_hosts`; otherwise they are dropped.
             let (temp, _sha) =
                 download::fetch_artifact(cfg, &asset, "runtime", &cfg.http.credential_hosts)?;
-            let runtime_dir = cfg.global.data_dir.join("runtime");
             install::place_runtime(&runtime_dir, &temp, format, name)?;
             let _ = std::fs::remove_file(&temp);
+            if let Some(want) = expected {
+                verify_runtime_version(&runtime_dir.join(name), &probe_args, want)?;
+            }
             Ok(Some(runtime_dir))
         }
+    }
+}
+
+/// Args that make a runtime print its version, from `[runtime].version_check`
+/// (whitespace-split), defaulting to `--version`.
+fn runtime_probe_args(version_check: Option<&str>) -> Vec<String> {
+    match version_check {
+        Some(s) if !s.trim().is_empty() => s.split_whitespace().map(str::to_owned).collect(),
+        _ => vec!["--version".to_owned()],
+    }
+}
+
+/// Run `program <args>` and return its combined stdout+stderr, or `None` if the
+/// program can't be executed at all (spawn error). Runtimes print their version to
+/// either stream, so both are captured.
+fn probe_output(program: &OsStr, args: &[String]) -> Option<String> {
+    let out = Command::new(program).args(args).output().ok()?;
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    Some(text)
+}
+
+/// Does `program`'s version-probe output contain `expected`? A probe that fails to
+/// execute (wrong arch, missing lib, bad path) counts as not-OK.
+fn runtime_version_ok(program: &OsStr, args: &[String], expected: &str) -> bool {
+    probe_output(program, args).is_some_and(|out| out.contains(expected))
+}
+
+/// Confirm a freshly downloaded runtime reports `expected`; a mismatch (or a probe
+/// that won't run) is a hard error — the configured `download` served the wrong
+/// version, or `version`/`version_check` is misconfigured.
+fn verify_runtime_version(bin: &Path, args: &[String], expected: &str) -> Result<()> {
+    match probe_output(bin.as_os_str(), args) {
+        Some(out) if out.contains(expected) => {
+            tracing::info!(version = expected, "downloaded runtime version verified");
+            Ok(())
+        }
+        Some(out) => Err(Error::Process(format!(
+            "downloaded runtime version mismatch: expected {expected:?}, but `{bin} {probe}` reported {got:?}",
+            bin = bin.display(),
+            probe = args.join(" "),
+            got = out.lines().next().unwrap_or("").trim(),
+        ))),
+        None => Err(Error::Process(format!(
+            "could not run `{bin} {probe}` to verify the downloaded runtime version",
+            bin = bin.display(),
+            probe = args.join(" "),
+        ))),
     }
 }
 
@@ -419,10 +525,13 @@ fn build_exec_argv(command: &str, entry: &str, dir: &str, args: &[String]) -> Re
 }
 
 /// Build the child environment: inherit the host env minus all config `LODE_*`
-/// vars, optionally prepend the runtime dir to PATH, then inject the read-only
-/// introspection vars (design §10).
+/// vars, apply the operator's `[env]` overrides, optionally prepend the runtime dir
+/// to PATH, then inject the read-only introspection vars (design §10). Precedence
+/// (low → high): operator `[env]` defaults < inherited host env < runtime
+/// PATH-prepend < lode's `LODE_*` vars.
 fn child_env(
     host: impl IntoIterator<Item = (String, String)>,
+    defined: &BTreeMap<String, String>,
     version: &str,
     data_dir: &Path,
     instance: &str,
@@ -432,13 +541,33 @@ fn child_env(
         .into_iter()
         .filter(|(key, _)| !key.starts_with("LODE_"))
         .collect();
+    // The `[env]` table is DEFAULTS: applied only for keys the inherited host env
+    // doesn't already provide, so a per-deploy `-e KEY=…` (any inherited env var)
+    // overrides `[env]`.
+    for (key, value) in defined {
+        if !env.iter().any(|(k, _)| k == key) {
+            env.push((key.to_owned(), value.to_owned()));
+        }
+    }
     if let Some(dir) = runtime_dir {
         prepend_path(&mut env, dir);
     }
-    env.push(("LODE_ACTIVE_VERSION".to_owned(), version.to_owned()));
-    env.push(("LODE_DATA_DIR".to_owned(), data_dir.display().to_string()));
-    env.push(("LODE_INSTANCE".to_owned(), instance.to_owned()));
+    // lode's introspection vars always win — set (not push) so a `[env]` entry of
+    // the same name can't leave a duplicate behind.
+    set_env(&mut env, "LODE_ACTIVE_VERSION", version);
+    set_env(&mut env, "LODE_DATA_DIR", &data_dir.display().to_string());
+    set_env(&mut env, "LODE_INSTANCE", instance);
     env
+}
+
+/// Set `key` to `value` in `env`, replacing an existing entry or appending a new
+/// one (so the result never holds a duplicate key).
+fn set_env(env: &mut Vec<(String, String)>, key: &str, value: &str) {
+    if let Some((_, slot)) = env.iter_mut().find(|(k, _)| k == key) {
+        value.clone_into(slot);
+    } else {
+        env.push((key.to_owned(), value.to_owned()));
+    }
 }
 
 /// Prepend `dir` to the PATH entry in `env` (or create PATH if absent).
@@ -1009,6 +1138,7 @@ impl<'c> Supervisor<'c> {
         let argv = build_run_argv(&self.cfg.command.run, &entry, &dir)?;
         let mut env = child_env(
             std::env::vars(),
+            &self.cfg.env,
             &self.target.version,
             &self.cfg.global.data_dir,
             &instance,
@@ -1868,7 +1998,14 @@ mod tests {
             ("PATH".to_owned(), "/usr/bin".to_owned()),
             ("HOME".to_owned(), "/root".to_owned()),
         ];
-        let env = child_env(host, "1.2.3", Path::new("/data"), "inst-9", None);
+        let env = child_env(
+            host,
+            &BTreeMap::new(),
+            "1.2.3",
+            Path::new("/data"),
+            "inst-9",
+            None,
+        );
         let map: std::collections::HashMap<_, _> = env.into_iter().collect();
 
         // All config LODE_* are stripped from the inherited set...
@@ -1886,10 +2023,60 @@ mod tests {
     }
 
     #[test]
+    fn child_env_defined_are_defaults_host_wins() {
+        let host = vec![
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+            ("NODE_ENV".to_owned(), "development".to_owned()),
+        ];
+        let defined: BTreeMap<String, String> = [
+            ("NODE_ENV".to_owned(), "production".to_owned()), // host has it → host wins
+            ("APP_FLAG".to_owned(), "on".to_owned()),         // host lacks it → default applied
+            ("LODE_DATA_DIR".to_owned(), "/hijack".to_owned()), // lode's var still wins below
+        ]
+        .into_iter()
+        .collect();
+        let env = child_env(host, &defined, "1.0.0", Path::new("/data"), "i", None);
+
+        // Exactly one entry per key — defaults fill gaps, they don't duplicate.
+        assert_eq!(env.iter().filter(|(k, _)| k == "NODE_ENV").count(), 1);
+        assert_eq!(env.iter().filter(|(k, _)| k == "LODE_DATA_DIR").count(), 1);
+
+        let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+        // Inherited host env wins over a same-named [env] default (12-factor `-e`).
+        assert_eq!(map.get("NODE_ENV").map(String::as_str), Some("development"));
+        // A [env] key the host lacks is applied as the default.
+        assert_eq!(map.get("APP_FLAG").map(String::as_str), Some("on"));
+        // lode's injected vars still win over any [env] of the same name.
+        assert_eq!(map.get("LODE_DATA_DIR").map(String::as_str), Some("/data"));
+    }
+
+    #[test]
+    fn child_env_host_path_wins_over_defined_then_runtime_prepends() {
+        // A host PATH beats a [env] PATH default; the runtime dir still prepends.
+        let host = vec![("PATH".to_owned(), "/usr/bin".to_owned())];
+        let mut defined = BTreeMap::new();
+        defined.insert("PATH".to_owned(), "/opt/bin".to_owned()); // ignored: host has PATH
+        let env = child_env(
+            host,
+            &defined,
+            "1.0.0",
+            Path::new("/data"),
+            "i",
+            Some(Path::new("/rt")),
+        );
+        let path = env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone());
+        assert_eq!(path.as_deref(), Some("/rt:/usr/bin"));
+    }
+
+    #[test]
     fn child_env_prepends_runtime_to_path() {
         let host = vec![("PATH".to_owned(), "/usr/bin".to_owned())];
         let env = child_env(
             host,
+            &BTreeMap::new(),
             "1.0.0",
             Path::new("/data"),
             "i",
@@ -1903,9 +2090,31 @@ mod tests {
     }
 
     #[test]
+    fn child_env_prepends_runtime_to_defined_path() {
+        // When the host has no PATH, the [env] default is used — and still extended
+        // by the runtime prepend.
+        let mut defined = BTreeMap::new();
+        defined.insert("PATH".to_owned(), "/opt/bin".to_owned());
+        let env = child_env(
+            Vec::new(),
+            &defined,
+            "1.0.0",
+            Path::new("/data"),
+            "i",
+            Some(Path::new("/rt")),
+        );
+        let path = env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone());
+        assert_eq!(path.as_deref(), Some("/rt:/opt/bin"));
+    }
+
+    #[test]
     fn child_env_creates_path_when_absent() {
         let env = child_env(
             Vec::new(),
+            &BTreeMap::new(),
             "1.0.0",
             Path::new("/data"),
             "i",
@@ -1962,21 +2171,32 @@ mod tests {
     #[test]
     fn runtime_plan_decisions() {
         assert_eq!(
-            plan_runtime(None, None, false).unwrap(),
+            plan_runtime(None, None, false, false).unwrap(),
             RuntimePlan::NotNeeded
         );
-        // Already on PATH → skip the download.
+        // Already on PATH → skip the download (system runtime wins over cache).
         assert_eq!(
-            plan_runtime(Some("bun"), Some("https://x/bun.zip"), true).unwrap(),
+            plan_runtime(Some("bun"), Some("https://x/bun.zip"), true, true).unwrap(),
             RuntimePlan::AlreadyPresent
+        );
+        // Off PATH but cached from a prior launch → reuse, no network (even if a
+        // download URL is set).
+        assert_eq!(
+            plan_runtime(Some("bun"), Some("https://x/bun.zip"), false, true).unwrap(),
+            RuntimePlan::Cached
+        );
+        // Off PATH, no cache, no download URL, but cached present → still reused.
+        assert_eq!(
+            plan_runtime(Some("bun"), None, false, true).unwrap(),
+            RuntimePlan::Cached
         );
         // Missing + download configured → fetch.
         assert_eq!(
-            plan_runtime(Some("bun"), Some("https://x/bun.zip"), false).unwrap(),
+            plan_runtime(Some("bun"), Some("https://x/bun.zip"), false, false).unwrap(),
             RuntimePlan::Fetch
         );
-        // Missing + no download → error.
-        assert!(plan_runtime(Some("bun"), None, false).is_err());
+        // Missing everywhere + no download → error.
+        assert!(plan_runtime(Some("bun"), None, false, false).is_err());
     }
 
     #[test]
@@ -2003,6 +2223,55 @@ mod tests {
         let path_var = dir.display().to_string();
         assert!(on_path("mytool", &path_var));
         assert!(!on_path("absent", &path_var));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_probe_args_defaults_to_version_flag() {
+        assert_eq!(runtime_probe_args(None), vec!["--version".to_owned()]);
+        assert_eq!(runtime_probe_args(Some("  ")), vec!["--version".to_owned()]);
+        assert_eq!(runtime_probe_args(Some("-v")), vec!["-v".to_owned()]);
+        assert_eq!(
+            runtime_probe_args(Some("eval Bun.version")),
+            vec!["eval".to_owned(), "Bun.version".to_owned()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_version_probe_matches_and_rejects() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("lode-rtver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A stand-in runtime whose `--version` prints "1.1.38" (like bun's output).
+        let bin = dir.join("fakert");
+        std::fs::write(&bin, b"#!/bin/sh\necho 1.1.38\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let args = runtime_probe_args(None);
+
+        // Substring match handles bare and prefixed (e.g. node's "v22…") forms.
+        assert!(runtime_version_ok(bin.as_os_str(), &args, "1.1.38"));
+        assert!(runtime_version_ok(bin.as_os_str(), &args, "1.1"));
+        assert!(!runtime_version_ok(bin.as_os_str(), &args, "1.2.0"));
+        // A binary that can't be executed → not OK, never a panic.
+        assert!(!runtime_version_ok(
+            dir.join("absent").as_os_str(),
+            &args,
+            "1.1.38"
+        ));
+
+        // verify_runtime_version: ok on match, Err on mismatch / unrunnable.
+        assert!(verify_runtime_version(&bin, &args, "1.1.38").is_ok());
+        assert!(matches!(
+            verify_runtime_version(&bin, &args, "9.9.9"),
+            Err(Error::Process(_))
+        ));
+        assert!(matches!(
+            verify_runtime_version(&dir.join("absent"), &args, "1.1.38"),
+            Err(Error::Process(_))
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

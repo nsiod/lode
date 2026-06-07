@@ -1,0 +1,62 @@
+# node.lode.toml — run a Node.js app under lode without building a per-app image.
+#
+# Model: a generic base image (e.g. zzci/ubase) carries only lode; lode downloads
+# `node` ONCE into its runtime cache ($DATA_DIR/runtime/node) and reuses it on every
+# later boot. Each app ships only this lode.toml + a release artifact.
+#
+# IMPORTANT: lode runs your artifact directly — there is no `npm install` step.
+# Ship a *bundled* single file (esbuild / `bun build` / @vercel/ncc), or a tarball
+# with node_modules already vendored. Bundle TypeScript to JS, or on Node >= 22 run
+# it with `run = "node --experimental-strip-types"`.
+#
+#   docker run --rm -e PORT=8080 -p 8080:8080 \
+#     -v lode-myapp:/srv/lode \                      # persist the runtime cache + versions
+#     -v "$PWD/node.lode.toml:/srv/lode/lode.toml:ro" \
+#     -e LODE_TRUSTED_KEYS="<key_id>:<base64-pubkey>" \
+#     docker.io/dotns/lode:latest
+
+[global]
+app      = "myapp"
+data_dir = "/srv/lode"    # MUST be a persistent volume so the runtime cache survives restarts
+
+[update]
+github = "owner/myapp"
+# manifest = "https://releases.example.com/myapp/manifest.json"
+asset   = "app.mjs"       # a bundled ESM file. Tarball instead: asset = "myapp-1.0.0.tar.gz"
+channel = "stable"
+policy  = "auto"
+# pin   = "1.4.2"
+# entry = "dist/server.js"   # for a tarball: the in-archive entry (else {app} at root)
+
+[trust]
+require_signature = "enforce"
+trusted_keys = ["<key_id>:<base64-pubkey>"]
+
+# `node <entry>` for bare `lode`; `node <args>` for `lode <args>`.
+[command]
+run     = "node"          # TS on Node >= 22: run = "node --experimental-strip-types"
+exec    = "node"
+# workdir = "{dir}"   # optional; omit for the version dir (default), or set an absolute path
+
+# lode downloads node if absent from PATH, caches it at $DATA_DIR/runtime/node, and
+# reuses it next boot. The official .tar.gz works directly — lode hoists `node` out
+# of the nested node-vX/bin/ dir to runtime/node (npm/npx aren't needed at run time).
+# Use the .tar.gz, not .tar.xz (lode doesn't do xz). Runtime downloads are UNVERIFIED
+# — pin + trusted origin. Or bake node into the base image and drop this block.
+[runtime]
+runtime  = "node"
+download = "https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.gz"   # arm64: node-v22.11.0-linux-arm64.tar.gz
+version  = "22.11.0"   # probed via `node --version` (prints v22.11.0; matched as a substring)
+
+# Extra env for the child, as DEFAULTS — a per-deploy `-e KEY=VALUE` overrides them
+# (lode's LODE_* always win).
+[env]
+NODE_ENV = "production"
+# PORT   = "8080"   # or just pass `-e PORT=8080` to `docker run`
+
+[supervise]
+readiness     = "state"   # app writes state.ready = $LODE_INSTANCE once it can serve
+ready_timeout = 20
+health_grace  = 5
+stop_timeout  = 10
+restart       = "on-failure"

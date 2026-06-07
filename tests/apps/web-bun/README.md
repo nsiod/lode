@@ -77,7 +77,7 @@ Then use `entry = "app.js"` and `run = "bun run"` (so `bun run app.js`).
 [command]
 run     = "bun"       # bare `lode`   -> bun <entry>        (long-running server)
 exec    = "bun"       # `lode <args>` -> bun <args>
-workdir = "{dir}"     # version dir (default)
+# workdir = "{dir}"   # optional; omit for the version dir (default)
 
 [runtime]
 runtime  = "bun"

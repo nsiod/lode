@@ -63,10 +63,6 @@ pub(crate) enum Error {
     #[error("toml: {0}")]
     Toml(#[from] toml::de::Error),
 
-    /// Semantic-version parse error.
-    #[error("semver: {0}")]
-    Semver(#[from] semver::Error),
-
     /// Integer parse error (numeric config supplied as text).
     #[error("parse: {0}")]
     ParseInt(#[from] std::num::ParseIntError),

@@ -35,7 +35,6 @@ pub(crate) fn run(cfg: &Config, version: Option<&str>) -> Result<()> {
         version,
     )?;
     let entry = manifest::version_entry(&manifest, &target)?;
-    check_min_lode(entry, &target)?;
 
     let asset_name = cfg.update.asset.as_deref().ok_or_else(|| {
         Error::Config(
@@ -87,21 +86,6 @@ pub(crate) fn run(cfg: &Config, version: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Enforce a version's `min_lode` against this loader's version, if declared.
-fn check_min_lode(entry: &manifest::VersionEntry, version: &str) -> Result<()> {
-    let Some(min) = entry.min_lode.as_deref() else {
-        return Ok(());
-    };
-    let required = semver::Version::parse(min)?;
-    let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))?;
-    if current < required {
-        return Err(Error::Manifest(format!(
-            "version {version} requires lode >= {required}, but this loader is {current}"
-        )));
-    }
-    Ok(())
-}
-
 /// Is a supervised instance currently running? True when `state.pid` names a live
 /// process (a no-signal `kill` succeeds, design §13).
 fn running_instance(st: &state::State) -> bool {
@@ -119,37 +103,6 @@ fn process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{Asset, VersionEntry};
-
-    fn entry_with_min(min: Option<&str>) -> VersionEntry {
-        VersionEntry {
-            min_lode: min.map(ToOwned::to_owned),
-            notes: None,
-            assets: vec![Asset {
-                name: "x".to_owned(),
-                url: "http://127.0.0.1/x".to_owned(),
-                sha256: "00".to_owned(),
-                sig: None,
-                key_id: None,
-                entry: Some("x".to_owned()),
-                size: None,
-                auth: true,
-            }],
-        }
-    }
-
-    #[test]
-    fn min_lode_absent_or_satisfied_ok() {
-        assert!(check_min_lode(&entry_with_min(None), "1.0.0").is_ok());
-        // This loader is 0.1.0; a 0.0.x requirement is satisfied.
-        assert!(check_min_lode(&entry_with_min(Some("0.0.1")), "1.0.0").is_ok());
-    }
-
-    #[test]
-    fn min_lode_too_new_rejected() {
-        let err = check_min_lode(&entry_with_min(Some("99.0.0")), "1.0.0").unwrap_err();
-        assert!(matches!(err, Error::Manifest(_)));
-    }
 
     #[test]
     fn process_alive_for_self_and_dead_for_unused_pid() {

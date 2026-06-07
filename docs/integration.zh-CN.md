@@ -45,7 +45,7 @@ trusted_keys = ["<key_id>:<base64-公钥>"]           # 来自 `lode-cli keygen`
 [command]
 run     = "{entry}"         # 裸跑 `lode` → 启动应用({entry} = 安装后的路径)
 exec    = "{entry}"         # `lode <args>` → 直通基准
-workdir = "{dir}"           # 版本目录(默认)或绝对路径
+# workdir = "{dir}"         # 可选;省略即版本目录(默认)。需固定部署目录(如读 .env)可写绝对路径
 
 [supervise]
 readiness    = "state"      # none | state(仅当应用自报就绪后才提交该版本)
@@ -57,7 +57,7 @@ restart      = "off"        # off(镜像子进程)| on-failure | always
 常见形态:
 
 - **自带二进制:** `run = "{entry} serve"`、`exec = "{entry}"`。
-- **脚本 + 运行时:** `run = "bun run"`、`exec = "bun"`,再加 `[runtime]` 段,PATH 上没有 `bun` 时下载它(与产物一样校验)。
+- **脚本 + 运行时:** `run = "bun run"`、`exec = "bun"`,再加 `[runtime]` 段,PATH 上没有 `bun` 时下载它——下载后缓存复用,可用 `version` 锁版本;注意运行时下载**不做签名校验**。
 - **私有源:** 加 `[http].headers = ["Authorization: Bearer ${TOKEN}"]` —— 随 manifest 与产物请求发送,展开 `${ENV}`。
 
 全部选项及 `[runtime]`/`[signals]`/`restart_*` 见 [`lode.example.toml`](lode.example.toml)。
@@ -70,7 +70,8 @@ restart      = "off"        # off(镜像子进程)| on-failure | always
 
 **lode 注入的环境变量:** `LODE_ACTIVE_VERSION`(当前版本)、`LODE_DATA_DIR`
 (`state.json` 在 `$LODE_DATA_DIR/state.json`)、`LODE_INSTANCE`(本次启动唯一号 —— 写入
-`state.ready`)。宿主环境(如 `PORT`)原样透传;内部 `LODE_*` 已剥离。
+`state.ready`)。宿主环境(如 `PORT`)原样透传;内部 `LODE_*` 已剥离。operator 还可用 `[env]`
+表追加变量——它们是**默认值**:同名的宿主 env(如部署时 `-e PORT`)会覆盖它们,而 lode 上述三个变量始终最高。
 
 **state.json** —— lode 写状态、应用写请求,字段不重叠:
 

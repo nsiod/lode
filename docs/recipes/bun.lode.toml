@@ -1,0 +1,59 @@
+# bun.lode.toml — run a Bun app under lode without building a per-app image.
+#
+# Model: a generic base image (e.g. zzci/ubase) carries only lode; lode downloads
+# `bun` ONCE into its runtime cache ($DATA_DIR/runtime/bun) and reuses it on every
+# later boot. Each app then ships only this lode.toml + a release artifact — never a
+# `docker build`. See docs/recipes/README.md for the base image.
+#
+#   docker run --rm -e PORT=8080 -p 8080:8080 \
+#     -v lode-myapp:/srv/lode \                      # persist the runtime cache + versions
+#     -v "$PWD/bun.lode.toml:/srv/lode/lode.toml:ro" \
+#     -e LODE_TRUSTED_KEYS="<key_id>:<base64-pubkey>" \
+#     docker.io/dotns/lode:latest
+
+[global]
+app      = "myapp"        # must match the manifest/release "name"
+data_dir = "/srv/lode"    # MUST be a persistent volume so the runtime cache survives restarts
+
+[update]
+github = "owner/myapp"    # GitHub Releases …
+# manifest = "https://releases.example.com/myapp/manifest.json"  # … OR a native manifest (pick one)
+asset   = "app.js"        # the app artifact filename for THIS host (the selection key)
+channel = "stable"
+policy  = "auto"          # off | check | auto
+# pin   = "1.4.2"
+
+[trust]
+require_signature = "enforce"                 # off | auto | enforce
+trusted_keys = ["<key_id>:<base64-pubkey>"]   # from `lode-cli keygen`
+
+# How to launch. `bun run <entry>` for bare `lode`; `bun <args>` for `lode <args>`
+# (so `lode run db:migrate` == `bun run db:migrate`).
+[command]
+run     = "bun run"
+exec    = "bun"
+# workdir = "{dir}"   # optional; omit for the version dir (default), or set an absolute path
+
+# lode downloads bun if it's not on PATH, caches it at $DATA_DIR/runtime/bun, and
+# reuses it next boot (delete that file to force a re-download / version bump). The
+# official .zip works directly — lode hoists `bun` out of the nested bun-linux-x64/
+# dir to runtime/bun. Runtime downloads are UNVERIFIED — pin a version, trusted
+# origin. Or bake bun into the base image and drop this block (PATH wins over cache).
+[runtime]
+runtime  = "bun"
+download = "https://github.com/oven-sh/bun/releases/download/bun-v1.1.38/bun-linux-x64.zip"   # glibc; arm64: bun-linux-aarch64.zip
+version  = "1.1.38"   # probed via `bun --version`; a cache/PATH bun of another version is bypassed for a fresh download
+
+# Extra env for the child, as DEFAULTS — a per-deploy `-e KEY=VALUE` overrides them
+# (lode's LODE_* always win).
+[env]
+NODE_ENV = "production"   # bun reads NODE_ENV too
+# PORT   = "8080"         # or just pass `-e PORT=8080` to `docker run`
+
+# Supervise the web service: commit a new version only after the app reports ready.
+[supervise]
+readiness     = "state"   # app writes state.ready = $LODE_INSTANCE once it can serve
+ready_timeout = 20        # seconds to wait for ready before rollback
+health_grace  = 5         # seconds a new version must survive (single-strike rollback)
+stop_timeout  = 10        # graceful SIGTERM window before SIGKILL
+restart       = "on-failure"   # off | on-failure | always

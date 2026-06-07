@@ -53,14 +53,28 @@ trusted_keys = ["9787ab11e55b4cbc:nyQSShSI8fAtHZNiJWDemBbcaX6V9OvmXtovkITm4fc="]
 [command]
 run     = "bun run"   # bare `lode`   -> bun run <entry>
 exec    = "bun"       # `lode <args>` -> bun <args>   (so `lode run db:init` == `bun run db:init`)
-workdir = "{dir}"     # "{dir}" (version dir) or an absolute path
+# workdir = "{dir}"   # optional; omit for the version dir (default). Set an absolute path to run elsewhere (e.g. so the app finds its .env)
 # self-contained binary instead:  run = "{entry} serve"   exec = "{entry}"
 
-# --- run: optional runtime; downloaded to $DATA_DIR/runtime if absent from PATH ---
+# --- run: optional runtime; downloaded to $DATA_DIR/runtime if absent from PATH,
+#     then cached there and reused on later boots (a runtime on PATH wins over the cache) ---
 [runtime]
 runtime  = "bun"
-download = "https://example.com/bun-linux-x64.zip"
-# format = "zip"   # entry = "bun"   # sha256 = "<hex>"   # sig = "<base64>"
+download = "https://example.com/bun-linux-x64.zip"   # raw/.gz/.zip/.tar.gz; the binary is hoisted to runtime/<name> even from a nested archive
+# version       = "1.1.38"     # require this version: lode probes the runtime (PATH / cache / freshly
+#                              # downloaded) and requires the output to CONTAIN this string. A wrong-version
+#                              # PATH/cache entry is bypassed for a fresh download; a downloaded mismatch is
+#                              # a hard error. Pins the runtime version without manually clearing the cache.
+# version_check = "--version"  # arg(s) that print the version (default "--version"); only used with `version`
+
+# --- run: extra environment variables for the child (a plain key=value table) ---
+# DEFAULTS: applied only for keys the inherited host env doesn't already set, so a
+# per-deploy `-e KEY=…` (any inherited env var) overrides these. The runtime dir is
+# still prepended to PATH, and lode's own LODE_ACTIVE_VERSION/LODE_DATA_DIR/LODE_INSTANCE
+# always win.
+[env]
+# NODE_ENV = "production"
+# PORT     = "8080"
 
 # --- manage: supervise the service (bare `lode` only) ---
 [supervise]

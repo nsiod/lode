@@ -59,15 +59,15 @@ To build your own app image, layer lode onto any base:
 
 ```dockerfile
 FROM oven/bun:1                       # or any runtime your app needs
-COPY --from=docker.io/dotns/lode:latest /lode /lode
-ENTRYPOINT ["/lode"]
+COPY --from=docker.io/dotns/lode:latest /usr/bin/lode /usr/bin/lode
+ENTRYPOINT ["/usr/bin/lode"]
 ```
 
 ## How it works
 
 ```
 generic image           ┌─────────────────────────────────────┐
-distroless/static  ────► │  lode  (static Rust binary)         │
+zzci/ubase         ────► │  lode  (static Rust binary)         │
                          └───────────────────┬─────────────────┘
                                              │ lode.toml + env + CLI
                                              ▼

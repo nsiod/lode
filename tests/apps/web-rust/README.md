@@ -77,7 +77,7 @@ BUILD_VERSION=0.0.3 BUILD_BAD=1   cargo build --release && cp target/release/web
 [command]
 run     = "{entry}"   # bare `lode`   -> run the binary as the long-running server
 exec    = "{entry}"   # `lode <args>` -> binary <args>  (e.g. `lode version`)
-workdir = "{dir}"     # version dir (default)
+# workdir = "{dir}"   # optional; omit for the version dir (default)
 ```
 
 See [`docs/lode.example.toml`](../../../docs/lode.example.toml) for a full `lode.toml`, and

@@ -57,15 +57,15 @@ require_signature = "enforce"
 
 ```dockerfile
 FROM oven/bun:1                       # 或任何你的应用所需运行时
-COPY --from=docker.io/dotns/lode:latest /lode /lode
-ENTRYPOINT ["/lode"]
+COPY --from=docker.io/dotns/lode:latest /usr/bin/lode /usr/bin/lode
+ENTRYPOINT ["/usr/bin/lode"]
 ```
 
 ## 工作原理
 
 ```
 通用镜像                  ┌─────────────────────────────────────┐
-distroless/static  ────► │  lode  (静态 Rust 二进制)            │
+zzci/ubase         ────► │  lode  (静态 Rust 二进制)            │
                          └───────────────────┬─────────────────┘
                                              │ lode.toml + 环境变量 + CLI
                                              ▼

@@ -4,7 +4,7 @@
 
 > A general-purpose "update + launch" component: a **small static Rust binary** (a few MB), language-agnostic.
 > It verifies **file integrity (sha256)** and **publisher identity (ed25519 signature)**, then launches and manages the service, supporting seamless hot-update and rollback.
-> Universal image = `distroless/static` + the lode binary (no language runtime required); one instance = **single program, single channel**.
+> Universal image = `zzci/ubase` + the lode binary (no language runtime required; the runtime, if any, is downloaded and cached at boot); one instance = **single program, single channel**.
 
 This document is the authoritative **architecture spec**; the implementation follows it. It adheres to the **pma-rust** hard locks (edition 2024, `#![forbid(unsafe_code)]`, rustls+aws-lc-rs, deny-warnings, musl+crt-static, cargo-deny/shear/typos/nextest).
 
@@ -14,8 +14,8 @@ This document is the authoritative **architecture spec**; the implementation fol
 
 - **loader (lode)**: a fixed, unchanging "update + launch" component, compiled into a small static binary, baked into the universal image once and never rebuilt. Responsibilities: configuration → PID lock → decide which version to run → download/**verify (integrity + identity)**/install when necessary → atomic activation → launch and **manage the service** as a **child process** → hot-update/rollback per policy → communicate with the app via **`state.json`**.
 - **app**: a program in any language, packaged and signed by a trusted publisher, published to a manifest; lode runs it after verification passes. **lode is not tied to the application language** (how it runs is specified by `[command]` in `lode.toml`).
-- **Why Rust**: a Bun-compiled lode is ≈ 91MB (it embeds the JS runtime), and the image has to carry it along; a static Rust build (musl) is ≈ a few MB, the image can be `FROM scratch`/distroless — this is what truly delivers "language-agnostic + small."
-- **Relationship**: `universal image (distroless + lode)` + `remote manifest/signed packages` → on container start, verify and run the application per policy. Switching apps = switching `[update].manifest` (env `LODE_MANIFEST`), with zero image rebuilds.
+- **Why Rust**: a Bun-compiled lode is ≈ 91MB (it embeds the JS runtime), and the image has to carry it along; a static Rust build (musl) is ≈ a few MB and runs on **any** base (scratch, distroless, or a fuller image like `zzci/ubase`) — this is what truly delivers "language-agnostic + small."
+- **Relationship**: `universal image (zzci/ubase + lode)` + `remote manifest/signed packages` → on container start, verify and run the application per policy. Switching apps = switching `[update].manifest` (env `LODE_MANIFEST`), with zero image rebuilds.
 
 ### Decided design (hard constraints)
 
@@ -35,7 +35,7 @@ This document is the authoritative **architecture spec**; the implementation fol
 
 ```
 universal image (built once)      ┌──────────────────────────────────┐
-distroless/static                 │  lode (static Rust binary, a few MB) │
+zzci/ubase                        │  lode (static Rust binary, a few MB) │
                                   └────────────────┬─────────────────┘
                   lode.toml (local config) │ read CLI / env / lode.toml
                                            ▼
@@ -60,7 +60,7 @@ distroless/static                 │  lode (static Rust binary, a few MB) │
 ## 3. Runtime form: Rust modularity + small static binary
 
 - Split into multiple files by module (§14), compiling into a **single static binary**; `*-unknown-linux-musl` + `+crt-static`, with `ldd` showing "not a dynamic executable".
-- **Image**: `FROM gcr.io/distroless/static` (includes CA certificates, so HTTPS package fetches are hassle-free) → `COPY lode /lode` → `ENTRYPOINT ["/lode"]`. The app brings its own runtime or is itself a static binary → the image can be extremely small.
+- **Image**: `FROM zzci/ubase` (a general-purpose base with libc/shell/tools, so it can also host a runtime lode downloads at boot) → `COPY lode /usr/bin/lode` → `ENTRYPOINT ["/usr/bin/lode"]`. lode's TLS roots are bundled (webpki-roots), so no system CA certificates are required. lode is a static binary that also runs on a minimal base (`scratch`/distroless) when the app brings its own runtime or is itself static.
 - **Dependencies (pure Rust / pma-rust compliant, no tokio/axum, synchronous implementation to stay small)**:
   - HTTP: `ureq` + `rustls` (aws-lc-rs provider, `install_default()` in `main`)
   - Serialization: `serde` + `serde_json` (manifest/state) + `toml` (lode.toml); versioning: `semver`
@@ -101,13 +101,20 @@ Division of labor: **landing is delegated to the manifest's `format`, running is
 
 ### Runtime download (`[runtime]`, optional)
 
-When `run`/`exec` depends on a runtime (such as `bun`), it can be declared in the `[runtime]` section of `lode.toml`: lode first checks PATH, and **if it's missing, downloads it from `download`** (the same `format` unpacking and `sha256`/`sig` verification as artifacts are supported), places it in `$DATA_DIR/runtime/`, and **prepends that directory to the child process's PATH**. A self-contained binary omits this table.
+When `run`/`exec` depends on a runtime (such as `bun`), it can be declared in the `[runtime]` section of `lode.toml`. Resolution order is **PATH → cache → download**: lode first checks PATH; otherwise it reuses a previously downloaded runtime from `$DATA_DIR/runtime/<name>`; otherwise it downloads `download`. A self-contained binary omits this table.
+
+- **Format / hoist**: the `format` is inferred from the URL extension (`raw`/`gz`/`zip`/`tar.gz`); after extraction the named binary is hoisted to `runtime/<name>`, so nested official archives work (bun's `bun-linux-x64/bun`, node's `node-vX/bin/node`) as well as flat ones (deno) and single files.
+- **Cache**: the placed `runtime/<name>` is reused on later boots — with a persistent `$DATA_DIR` the download is a one-time cost. Delete the file to force a re-download.
+- **Unverified**: unlike an app artifact, a runtime download carries **no `sha256`/`sig`** and is **not** integrity/identity-checked. Pin a version, host on a trusted origin, and add its host to `[http].credential_hosts` if it needs credentials.
+- **Version pin** (`version` + `version_check`): when `version` is set, lode probes the runtime it's about to use (PATH/cache/downloaded) by running it with `version_check` (default `--version`) and requires the output to **contain** `version`. A wrong-version PATH/cache entry is bypassed for a fresh download; a downloaded mismatch is a hard error.
+- lode then **prepends `$DATA_DIR/runtime/` to the child's PATH**.
 
 ```toml
 [runtime]
-runtime  = "bun"                                    # the executable name used by run/exec
-download = "https://example.com/bun-linux-x64.zip"  # downloaded when bun is not found on PATH
-# format = "zip"   # entry = "bun"   # sha256 = "…"   # sig = "…"
+runtime       = "bun"                                    # the executable name used by run/exec
+download      = "https://example.com/bun-linux-x64.zip"  # downloaded when bun is not found on PATH/cache
+version       = "1.1.38"                                 # optional: require this version (substring of the probe output)
+# version_check = "--version"                            # optional: arg(s) that print the version (default --version)
 ```
 
 ### Asset selection (by filename)
@@ -271,7 +278,7 @@ The fields owned by lode vs. the fields owned by the app (`target`/`restart_nonc
 
 A minimal rule:
 
-- **`lode` (bare) = launch and supervise the service**: lock (single instance) → determine/install the version (+ download the runtime if needed) → run **`run`** (from lode.toml, auto-appending `{entry}`) → supervise (per the `supervise.restart` policy, default mirrors the child process) → poll for hot-update/rollback per policy → signal passthrough as above. Suited to a server/daemon. With image `ENTRYPOINT ["/lode"]`, `docker run img` launches it.
+- **`lode` (bare) = launch and supervise the service**: lock (single instance) → determine/install the version (+ download the runtime if needed) → run **`run`** (from lode.toml, auto-appending `{entry}`) → supervise (per the `supervise.restart` policy, default mirrors the child process) → poll for hot-update/rollback per policy → signal passthrough as above. Suited to a server/daemon. With image `ENTRYPOINT ["/usr/bin/lode"]`, `docker run img` launches it.
 - **`lode <args...>` (with any arguments) = CLI passthrough**: **no lock, no supervision, no polling**. Verify the target version (bootstrap if none) → **exec replace** with **`exec` + `<args>`**, passing through stdin/stdout/stderr (including TTY), with signals and exit codes handled natively by the OS.
   - `lode run db:init` → `exec + ["run","db:init"]` (if `exec="bun"`, then ≡ `bun run db:init`). **No `--` needed**; **no `run` subcommand is used**, so it doesn't conflict with `bun run`.
   - Positional arguments pass through via clap `trailing_var_arg` + `allow_hyphen_values` (`lode` has no subcommands; all arguments belong to the app).
@@ -357,9 +364,13 @@ Key names: `lode.toml` uses snake_case (see `docs/lode.example.toml`); environme
 | `LODE_RUN` | `--run <cmd>` | `command.run` | `{entry}` | **bare-run launch command** (`{entry}` auto-appended when missing), see §4 |
 | `LODE_EXEC` | `--exec <cmd>` | `command.exec` | `{entry}` | **CLI passthrough base command** (`lode <args>` appended after it), see §4 |
 | `LODE_WORKDIR` | `--workdir <path>` | `command.workdir` | `{dir}` | child process cwd (version directory or absolute path), see §4 |
+| **`[env]` — extra child env** (config-file only; no CLI/env override) | | | | |
+| — | — | `[env]` (table) | — | extra env vars for the child, as **defaults** — an inherited host env var of the same name wins (lode's own `LODE_*` win over all), see §4 |
 | **`[runtime]` — optional runtime** | | | | |
 | `LODE_RUNTIME` | `--runtime <name>` | `runtime.runtime` | — | runtime executable name (used by run/exec), see §4 |
-| `LODE_RUNTIME_DOWNLOAD` | `--runtime-download <url>` | `runtime.download` | — | download URL when the runtime is missing |
+| `LODE_RUNTIME_DOWNLOAD` | `--runtime-download <url>` | `runtime.download` | — | download URL when the runtime is missing (cached + reused; not signature-verified) |
+| `LODE_RUNTIME_VERSION` | `--runtime-version <ver>` | `runtime.version` | — | required runtime version; probed and matched as a substring of the probe output, §4 |
+| `LODE_RUNTIME_VERSION_CHECK` | `--runtime-version-check <args>` | `runtime.version_check` | `--version` | arg(s) that print the runtime version (used only with `version`) |
 | **`[supervise]` — supervision (restart policy/health/rollback/stop/restart mode)** | | | | |
 | `LODE_RESTART` | `--restart <off\|on-failure\|always>` | `supervise.restart` | `off` | restart policy: `off` = mirror the child process (lode exits with it); `on-failure` = restart only on crash; `always` = restart on any exit, §8 |
 | `LODE_RESTART_BACKOFF` | `--restart-backoff <ms>` | `supervise.restart_backoff` | `500` | restart backoff base (exponential); effective only when `restart != off` |
@@ -375,7 +386,7 @@ Key names: `lode.toml` uses snake_case (see `docs/lode.example.toml`); environme
 | `LODE_FORWARD_SIGNALS` | `--forward-signals <list>` | `signals.forward` | (standard set) | the set of signals forwarded to the child process, §8 |
 | `LODE_RESTART_SIGNAL` | `--restart-signal <sig>` | `signals.restart` | — | the signal that triggers a graceful restart (unset by default), §8 |
 
-Child-process environment: pass through the host environment and **strip configuration-class `LODE_*`**; inject the read-only introspection variables `LODE_ACTIVE_VERSION`, `LODE_DATA_DIR`, `LODE_INSTANCE` (the unique number for this startup, used for the readiness handshake, §8).
+Child-process environment: pass through the host environment and **strip configuration-class `LODE_*`**; apply the operator's `[env]` table as **defaults** (only for keys the host env doesn't already set); prepend the runtime dir to PATH; then inject the read-only introspection variables `LODE_ACTIVE_VERSION`, `LODE_DATA_DIR`, `LODE_INSTANCE` (the unique number for this startup, used for the readiness handshake, §8). Precedence low→high: `[env]` defaults < inherited host env < runtime PATH-prepend < injected `LODE_*`.
 
 ---
 
@@ -405,7 +416,7 @@ The remote manifest is provided by the publisher, in **JSON format** (UTF-8), fe
 
 - Top level: `schema` (required, `"lode/v1"`), `name` (required, must match `app` in `lode.toml`), `key_id` (optional, the default signing public-key id), `sig` (optional, the ed25519 catalog signature, §6).
 - `channels` (required): an object, keyed by channel name, with values containing `latest` (a version id). **Multiple channels are allowed**, and lode follows one per `channel`.
-- `versions` (required): an object, keyed by version id (referenced by a channel's `latest`), with values containing `min_lode`/`notes` (optional) + an `assets` array (≥1).
+- `versions` (required): an object, keyed by version id (referenced by a channel's `latest`), with values containing `notes` (optional) + an `assets` array (≥1).
 - Each asset is keyed by its **filename** (`name`); the operator selects one via `[update].asset`:
 
 | Field | Required | Description |
@@ -489,7 +500,7 @@ The native manifest is the authoritative format (explicit, signable, and placeab
 
 ## 13. CLI — multi-call binary (`lode` / `lode-cli`)
 
-lode is a **multi-call binary**, dispatching by `argv[0]`: `lode-cli` is a **symlink** to the same binary, released together with it; inside the image both `/lode` and `/lode-cli` are available.
+lode is a **multi-call binary**, dispatching by `argv[0]`: `lode-cli` is a **symlink** to the same binary, released together with it; inside the image both `/usr/bin/lode` and `/usr/bin/lode-cli` are on PATH.
 
 ```
 # invoked as lode = pure loader, no subcommands at all
@@ -580,7 +591,7 @@ $DATA_DIR/
 ## 17. Deliverables
 
 - `src/` etc. — modular Rust source, compiling into a **single static binary `lode`**.
-- `Dockerfile` — the universal image (`FROM gcr.io/distroless/static` + `COPY lode`); multi-stage build (musl compile → copy).
+- `Dockerfile` — the universal image (`FROM zzci/ubase` + `COPY lode /usr/bin/lode`); built from prebuilt release binaries.
 - `tests/` — a bun + TypeScript end-to-end test suite (`tests/src`), example apps (`tests/apps/web-rust`, `tests/apps/web-bun`), and docker-compose integration (`tests/compose`).
 - `docs/integration.md` — the end-to-end integration guide (configure `lode.toml` → app contract → publish the manifest).
 - `README.md` / `README.zh-CN.md` — an overview aligned with this document (English / Chinese).
